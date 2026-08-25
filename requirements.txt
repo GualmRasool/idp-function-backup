@@ -1,0 +1,7 @@
+azure-functions>=1.20.0
+azure-storage-blob
+openai>=1.40.0
+pymupdf
+azure-ai-documentintelligence
+opencv-python-headless
+numpy
