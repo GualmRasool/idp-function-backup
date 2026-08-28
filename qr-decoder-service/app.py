@@ -1,23 +1,30 @@
-import io
-import os
 import logging
+import os
 
 import cv2
 import numpy as np
-
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-from PIL import Image, ImageOps
-from pyzbar.pyzbar import decode, ZBarSymbol
+from pyzbar.pyzbar import ZBarSymbol, decode
 
 
 app = FastAPI(
     title="Pyzbar QR Decoder POC",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 QR_API_KEY = os.environ.get("QR_API_KEY", "")
-
 MAX_FILE_SIZE = 15 * 1024 * 1024
+
+# Relative crop coordinates: name, x1, y1, x2, y2.
+# These cover common document QR positions while retaining a full-image pass.
+CROP_REGIONS = (
+    ("bottom_left_35", 0.00, 0.65, 0.35, 1.00),
+    ("bottom_left_50", 0.00, 0.50, 0.50, 1.00),
+    ("bottom_half", 0.00, 0.50, 1.00, 1.00),
+    ("top_left_35", 0.00, 0.00, 0.35, 0.35),
+    ("top_right_35", 0.65, 0.00, 1.00, 0.35),
+    ("bottom_right_35", 0.65, 0.65, 1.00, 1.00),
+)
 
 
 def validate_api_key(x_api_key):
@@ -34,22 +41,19 @@ def validate_api_key(x_api_key):
         )
 
 
-def pyzbar_decode(candidate):
-    results = decode(
+def decode_candidate(candidate):
+    values = []
+
+    decoded_results = decode(
         candidate,
         symbols=[ZBarSymbol.QRCODE],
     )
 
-    values = []
-
-    for result in results:
+    for item in decoded_results:
         try:
-            value = result.data.decode(
-                "utf-8",
-                errors="strict",
-            ).strip()
+            value = item.data.decode("utf-8").strip()
         except UnicodeDecodeError:
-            value = result.data.decode(
+            value = item.data.decode(
                 "latin-1",
                 errors="replace",
             ).strip()
@@ -60,33 +64,26 @@ def pyzbar_decode(candidate):
     return values
 
 
-def build_image_variants(image_bytes):
-    file_array = np.frombuffer(
-        image_bytes,
-        dtype=np.uint8,
-    )
+def add_candidate(candidates, name, image):
+    if image is None or image.size == 0:
+        return
 
-    image = cv2.imdecode(
-        file_array,
-        cv2.IMREAD_COLOR,
-    )
+    candidates.append((name, image))
 
-    if image is None:
-        raise ValueError(
-            "The uploaded file is not a readable image"
-        )
 
-    gray = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2GRAY,
-    )
+def add_enhanced_variants(candidates, prefix, image):
+    """Create several variants while keeping Pyzbar as the decoder."""
+    if image is None or image.size == 0:
+        return
 
-    variants = [
-        image,
-        gray,
-    ]
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
 
-    # Contrast normalization.
+    add_candidate(candidates, f"{prefix}_color", image)
+    add_candidate(candidates, f"{prefix}_gray", gray)
+
     normalized = cv2.normalize(
         gray,
         None,
@@ -94,26 +91,27 @@ def build_image_variants(image_bytes):
         255,
         cv2.NORM_MINMAX,
     )
-    variants.append(normalized)
+    add_candidate(candidates, f"{prefix}_normalized", normalized)
 
-    # CLAHE can improve local contrast in uneven scans.
     clahe = cv2.createCLAHE(
         clipLimit=2.0,
         tileGridSize=(8, 8),
-    )
-    clahe_image = clahe.apply(gray)
-    variants.append(clahe_image)
+    ).apply(gray)
+    add_candidate(candidates, f"{prefix}_clahe", clahe)
 
-    # Otsu black-and-white version.
     _, otsu = cv2.threshold(
         gray,
         0,
         255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
-    variants.append(otsu)
+    add_candidate(candidates, f"{prefix}_otsu", otsu)
+    add_candidate(
+        candidates,
+        f"{prefix}_otsu_inverted",
+        cv2.bitwise_not(otsu),
+    )
 
-    # Adaptive threshold version.
     adaptive = cv2.adaptiveThreshold(
         gray,
         255,
@@ -122,32 +120,64 @@ def build_image_variants(image_bytes):
         31,
         5,
     )
-    variants.append(adaptive)
+    add_candidate(candidates, f"{prefix}_adaptive", adaptive)
+    add_candidate(
+        candidates,
+        f"{prefix}_adaptive_inverted",
+        cv2.bitwise_not(adaptive),
+    )
 
-    # Enlarged versions help when QR modules are very small.
-    enlarged = cv2.resize(
+    # Nearest-neighbor keeps QR module edges hard.
+    nearest_3x = cv2.resize(
+        gray,
+        None,
+        fx=3,
+        fy=3,
+        interpolation=cv2.INTER_NEAREST,
+    )
+    add_candidate(candidates, f"{prefix}_nearest_3x", nearest_3x)
+
+    # Cubic enlargement can help when the source is a photographed page.
+    cubic_3x = cv2.resize(
         gray,
         None,
         fx=3,
         fy=3,
         interpolation=cv2.INTER_CUBIC,
     )
-    variants.append(enlarged)
+    add_candidate(candidates, f"{prefix}_cubic_3x", cubic_3x)
 
-    enlarged_clahe = cv2.resize(
-        clahe_image,
-        None,
-        fx=3,
-        fy=3,
-        interpolation=cv2.INTER_CUBIC,
+    # Mild unsharp masking on the cubic enlargement.
+    blurred = cv2.GaussianBlur(cubic_3x, (0, 0), 2.0)
+    sharpened = cv2.addWeighted(
+        cubic_3x,
+        1.8,
+        blurred,
+        -0.8,
+        0,
     )
-    variants.append(enlarged_clahe)
+    add_candidate(candidates, f"{prefix}_sharpened_3x", sharpened)
 
-    # Try inverted images for reversed or badly scanned contrast.
-    variants.append(cv2.bitwise_not(otsu))
-    variants.append(cv2.bitwise_not(adaptive))
 
-    return variants
+def build_candidates(image):
+    height, width = image.shape[:2]
+    candidates = []
+
+    # Always try the complete image first.
+    add_enhanced_variants(candidates, "full", image)
+
+    # Then try common page regions. This is important when the QR occupies
+    # only a small fraction of a full-page image.
+    for name, x1, y1, x2, y2 in CROP_REGIONS:
+        left = max(0, min(width - 1, int(width * x1)))
+        top = max(0, min(height - 1, int(height * y1)))
+        right = max(left + 1, min(width, int(width * x2)))
+        bottom = max(top + 1, min(height, int(height * y2)))
+
+        crop = image[top:bottom, left:right]
+        add_enhanced_variants(candidates, name, crop)
+
+    return candidates
 
 
 @app.get("/health")
@@ -155,6 +185,7 @@ def health():
     return {
         "status": "healthy",
         "decoder": "pyzbar",
+        "version": "1.1.0",
     }
 
 
@@ -179,36 +210,69 @@ async def decode_qr(
             detail="Image exceeds the 15 MB POC limit",
         )
 
-    try:
-        variants = build_image_variants(image_bytes)
-    except ValueError as exc:
+    file_array = np.frombuffer(
+        image_bytes,
+        dtype=np.uint8,
+    )
+    image = cv2.imdecode(
+        file_array,
+        cv2.IMREAD_COLOR,
+    )
+
+    if image is None:
         raise HTTPException(
             status_code=400,
-            detail=str(exc),
-        ) from exc
+            detail=(
+                "The uploaded file is not a readable PNG/JPG image. "
+                "Render PDF pages to images before calling this endpoint."
+            ),
+        )
 
-    for index, candidate in enumerate(variants):
+    candidates = build_candidates(image)
+
+    logging.info(
+        "Received image width=%s height=%s candidates=%s",
+        image.shape[1],
+        image.shape[0],
+        len(candidates),
+    )
+
+    for index, (candidate_name, candidate) in enumerate(candidates):
         try:
-            values = pyzbar_decode(candidate)
+            values = decode_candidate(candidate)
 
             if values:
+                logging.info(
+                    "QR decoded candidate=%s values=%s",
+                    candidate_name,
+                    values,
+                )
                 return {
                     "found": True,
                     "qr_values": values,
                     "decoder": "pyzbar",
-                    "variant_index": index,
+                    "candidate": candidate_name,
+                    "candidate_index": index,
+                    "image_width": image.shape[1],
+                    "image_height": image.shape[0],
                 }
 
         except Exception as exc:
             logging.warning(
-                "Pyzbar failed on variant %s: %s",
-                index,
+                "Pyzbar failed candidate=%s error=%s",
+                candidate_name,
                 exc,
             )
+
+    logging.info("No QR decoded from any candidate")
 
     return {
         "found": False,
         "qr_values": [],
         "decoder": "pyzbar",
-        "variant_index": None,
+        "candidate": None,
+        "candidate_index": None,
+        "candidates_tested": len(candidates),
+        "image_width": image.shape[1],
+        "image_height": image.shape[0],
     }
