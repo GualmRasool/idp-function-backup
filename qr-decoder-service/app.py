@@ -48,7 +48,14 @@ def zxing_decode(image):
 
     try:
 
+        logging.info(
+    "Running ZXing on image"
+)
         results = zxingcpp.read_barcodes(image)
+        logging.info(
+    "ZXing results count=%s",
+    len(results)
+)
 
         decoded_items = []
 
