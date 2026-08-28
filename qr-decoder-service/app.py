@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from pyzbar.pyzbar import ZBarSymbol, decode
+import zxingcpp
 
 APP_VERSION = "1.2.0"
 app = FastAPI(title="Pyzbar QR Decoder POC", version=APP_VERSION)
@@ -43,6 +44,40 @@ def unique_values(results):
             values.append(value)
     return values
 
+def zxing_decode(image):
+
+    try:
+
+        results = zxingcpp.read_barcodes(image)
+
+        decoded_items = []
+
+        for barcode in results:
+
+            decoded_items.append({
+                "value": barcode.text,
+                "format": str(barcode.format),
+            })
+
+        return decoded_items
+
+    except Exception as exc:
+
+        logging.warning(
+            "ZXing decode failed: %s",
+            exc,
+        )
+
+        return []
+
+    except Exception as exc:
+
+        logging.warning(
+            "ZXing decode failed: %s",
+            exc,
+        )
+
+        return []
 
 def pyzbar_decode(image):
     return unique_values(decode(image, symbols=[ZBarSymbol.QRCODE]))
@@ -218,6 +253,28 @@ async def decode_qr(
 
     array = np.frombuffer(raw, dtype=np.uint8)
     image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    # --------------------------------------------------
+# ZXing direct detection
+# --------------------------------------------------
+
+zxing_results = zxing_decode(image)
+
+if zxing_results:
+
+    logging.info(
+        "ZXing decoded: %s",
+        zxing_results
+    )
+
+    return {
+        "found": True,
+        "decoder": "zxing",
+        "barcode_type":
+            zxing_results[0]["format"],
+        "qr_values": [
+            zxing_results[0]["value"]
+        ]
+    }
     if image is None:
         raise HTTPException(
             status_code=400,
