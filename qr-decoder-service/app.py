@@ -1,16 +1,16 @@
 import logging
 import os
+import time
 
 import cv2
 import numpy as np
 import zxingcpp
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from pyzbar.pyzbar import ZBarSymbol, decode
 
-
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 MAX_FILE_SIZE = 15 * 1024 * 1024
-MAX_CANDIDATES = 60
+MAX_EXHAUSTIVE_CANDIDATES = 60
 QR_API_KEY = os.environ.get("QR_API_KEY", "")
 
 app = FastAPI(
@@ -19,8 +19,6 @@ app = FastAPI(
 )
 
 # Relative page regions: name, x1, y1, x2, y2.
-# The lower-left regions target the known COA layout while the remaining
-# regions support other document layouts.
 CROP_REGIONS = (
     ("bottom_left_25", 0.00, 0.72, 0.25, 1.00),
     ("bottom_left_35", 0.00, 0.62, 0.35, 1.00),
@@ -31,6 +29,14 @@ CROP_REGIONS = (
     ("bottom_right_35", 0.65, 0.65, 1.00, 1.00),
 )
 
+FAST_REGION_NAMES = {
+    "full",
+    "bottom_left_25",
+    "bottom_left_35",
+    "bottom_left_50",
+    "bottom_half",
+}
+
 
 def validate_api_key(value):
     if not QR_API_KEY:
@@ -38,83 +44,47 @@ def validate_api_key(value):
             status_code=500,
             detail="QR_API_KEY is not configured",
         )
-
     if value != QR_API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def normalize_format(barcode_format):
     value = str(barcode_format)
-
-    # zxing-cpp versions may stringify enum values differently.
-    if "." in value:
-        value = value.split(".")[-1]
-
-    return value
+    return value.split(".")[-1] if "." in value else value
 
 
 def zxing_decode(image):
-    """Read all supported formats with ZXing-C++."""
     try:
-        logging.info(
-            "Running ZXing image_width=%s image_height=%s",
-            image.shape[1],
-            image.shape[0],
-        )
-
         results = zxingcpp.read_barcodes(
             image,
             try_rotate=True,
             try_downscale=True,
             try_invert=True,
         )
-
-        logging.info("ZXing results count=%s", len(results))
-
-        decoded_items = []
-
+        decoded = []
         for barcode in results:
             value = (barcode.text or "").strip()
-
-            if not value:
-                continue
-
-            item = {
-                "value": value,
-                "format": normalize_format(barcode.format),
-            }
-
-            logging.info(
-                "ZXing decoded format=%s value=%s",
-                item["format"],
-                item["value"],
-            )
-
-            decoded_items.append(item)
-
-        return decoded_items
-
+            if value:
+                decoded.append(
+                    {
+                        "value": value,
+                        "format": normalize_format(barcode.format),
+                    }
+                )
+        return decoded
     except Exception as exc:
         logging.exception("ZXing decode failed: %s", exc)
         return []
 
 
 def pyzbar_decode(image):
-    """Decode standard QR codes with Pyzbar/ZBar."""
     try:
-        results = decode(
-            image,
-            symbols=[ZBarSymbol.QRCODE],
-        )
+        results = decode(image, symbols=[ZBarSymbol.QRCODE])
     except Exception as exc:
         logging.warning("Pyzbar decode failed: %s", exc)
         return []
 
     values = []
-
     for item in results:
         try:
             value = item.data.decode("utf-8").strip()
@@ -123,19 +93,15 @@ def pyzbar_decode(image):
                 "latin-1",
                 errors="replace",
             ).strip()
-
         if value and value not in values:
             values.append(value)
-
     return values
 
 
 def add_quiet_zone(image, border_ratio=0.10):
     height, width = image.shape[:2]
     border = max(12, int(max(height, width) * border_ratio))
-
     border_value = 255 if image.ndim == 2 else (255, 255, 255)
-
     return cv2.copyMakeBorder(
         image,
         border,
@@ -149,7 +115,6 @@ def add_quiet_zone(image, border_ratio=0.10):
 
 def region_images(image):
     height, width = image.shape[:2]
-
     yield "full", image
 
     for name, x1, y1, x2, y2 in CROP_REGIONS:
@@ -157,107 +122,117 @@ def region_images(image):
         top = max(0, min(height - 1, int(height * y1)))
         right = max(left + 1, min(width, int(width * x2)))
         bottom = max(top + 1, min(height, int(height * y2)))
-
         crop = image[top:bottom, left:right]
-
         if crop.size:
             yield name, crop
 
 
-def candidate_images(region_name, image):
+def fast_candidate_images(image):
     """
-    Yield candidates one at a time to avoid retaining large image copies.
-    This keeps memory controlled while trying multi-format decoding.
+    Lightweight boundary scan. This path is used for every PDF page.
+    It deliberately avoids the expensive exhaustive preprocessing that can
+    block later page requests after a page without a barcode.
     """
-    yield f"{region_name}_color", image
+    for region_name, region in region_images(image):
+        if region_name not in FAST_REGION_NAMES:
+            continue
 
-    gray = (
-        cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        if image.ndim == 3
-        else image
-    )
-    yield f"{region_name}_gray", gray
+        yield f"{region_name}_color", region
 
-    normalized = cv2.normalize(
-        gray,
-        None,
-        0,
-        255,
-        cv2.NORM_MINMAX,
-    )
-    yield f"{region_name}_normalized", normalized
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        yield f"{region_name}_gray", gray
 
-    clahe = cv2.createCLAHE(
-        clipLimit=2.5,
-        tileGridSize=(8, 8),
-    ).apply(gray)
-    yield f"{region_name}_clahe", clahe
+        # A single bounded enlargement helps small symbols without creating
+        # long-running page requests.
+        if region_name != "full":
+            enlarged = cv2.resize(
+                gray,
+                None,
+                fx=3,
+                fy=3,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            yield (
+                f"{region_name}_cubic_3x",
+                add_quiet_zone(enlarged),
+            )
 
-    # Keep scaling bounded. The previous 8x/140-candidate approach consumed
-    # excessive memory. Candidates are now generated and released sequentially.
-    for scale in (3, 5):
-        nearest = cv2.resize(
+
+def exhaustive_candidate_images(image):
+    """Full fallback for individual documents or difficult barcode images."""
+    for region_name, region in region_images(image):
+        yield f"{region_name}_color", region
+
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        yield f"{region_name}_gray", gray
+
+        normalized = cv2.normalize(
             gray,
             None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_NEAREST,
-        )
-        yield (
-            f"{region_name}_nearest_{scale}x",
-            add_quiet_zone(nearest),
-        )
-
-        cubic = cv2.resize(
-            gray,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC,
-        )
-        yield (
-            f"{region_name}_cubic_{scale}x",
-            add_quiet_zone(cubic),
-        )
-
-        _, otsu = cv2.threshold(
-            cubic,
             0,
             255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+            cv2.NORM_MINMAX,
         )
-        yield (
-            f"{region_name}_otsu_{scale}x",
-            add_quiet_zone(otsu),
-        )
+        yield f"{region_name}_normalized", normalized
 
-        del nearest
-        del cubic
-        del otsu
+        clahe = cv2.createCLAHE(
+            clipLimit=2.5,
+            tileGridSize=(8, 8),
+        ).apply(gray)
+        yield f"{region_name}_clahe", clahe
+
+        for scale in (3, 5):
+            nearest = cv2.resize(
+                gray,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_NEAREST,
+            )
+            yield (
+                f"{region_name}_nearest_{scale}x",
+                add_quiet_zone(nearest),
+            )
+
+            cubic = cv2.resize(
+                gray,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            yield (
+                f"{region_name}_cubic_{scale}x",
+                add_quiet_zone(cubic),
+            )
+
+            _, otsu = cv2.threshold(
+                cubic,
+                0,
+                255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+            )
+            yield (
+                f"{region_name}_otsu_{scale}x",
+                add_quiet_zone(otsu),
+            )
 
 
 def order_points(points):
-    points = np.asarray(
-        points,
-        dtype=np.float32,
-    ).reshape(4, 2)
-
+    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
     ordered = np.zeros((4, 2), dtype=np.float32)
     sums = points.sum(axis=1)
     differences = np.diff(points, axis=1).reshape(-1)
-
     ordered[0] = points[np.argmin(sums)]
     ordered[2] = points[np.argmax(sums)]
     ordered[1] = points[np.argmin(differences)]
     ordered[3] = points[np.argmax(differences)]
-
     return ordered
 
 
 def perspective_warp(image, points, output_size=900):
     source = order_points(points)
     margin = int(output_size * 0.12)
-
     destination = np.array(
         [
             [margin, margin],
@@ -267,12 +242,7 @@ def perspective_warp(image, points, output_size=900):
         ],
         dtype=np.float32,
     )
-
-    matrix = cv2.getPerspectiveTransform(
-        source,
-        destination,
-    )
-
+    matrix = cv2.getPerspectiveTransform(source, destination)
     return cv2.warpPerspective(
         image,
         matrix,
@@ -284,9 +254,7 @@ def perspective_warp(image, points, output_size=900):
 
 
 def opencv_qr_decode_and_localize(image):
-    """Try OpenCV QR decoding and return a rectified candidate if located."""
     detector = cv2.QRCodeDetector()
-
     try:
         detector.setEpsX(0.35)
         detector.setEpsY(0.35)
@@ -295,27 +263,14 @@ def opencv_qr_decode_and_localize(image):
 
     try:
         value, points, straight = detector.detectAndDecode(image)
-
         if value:
             return value.strip(), None, True
-
         if straight is not None and getattr(straight, "size", 0) > 0:
             return None, straight, True
-
         if points is not None and np.asarray(points).size >= 8:
             return None, perspective_warp(image, points), True
-
     except Exception as exc:
         logging.debug("OpenCV detectAndDecode failed: %s", exc)
-
-    try:
-        found, points = detector.detect(image)
-
-        if found and points is not None:
-            return None, perspective_warp(image, points), True
-
-    except Exception as exc:
-        logging.debug("OpenCV detect failed: %s", exc)
 
     return None, None, False
 
@@ -328,7 +283,8 @@ def success_response(
     image_width,
     image_height,
     candidates_tested,
-    opencv_detected_count,
+    processing_seconds,
+    mode,
 ):
     return {
         "found": True,
@@ -339,7 +295,8 @@ def success_response(
         "candidates_tested": candidates_tested,
         "image_width": image_width,
         "image_height": image_height,
-        "opencv_detected_count": opencv_detected_count,
+        "processing_seconds": round(processing_seconds, 3),
+        "mode": mode,
         "version": APP_VERSION,
     }
 
@@ -366,106 +323,89 @@ def health():
 async def decode_barcode(
     file: UploadFile = File(...),
     x_api_key: str = Header(default=None),
+    mode: str = Query(default="exhaustive"),
 ):
     validate_api_key(x_api_key)
-
+    started = time.monotonic()
     raw = await file.read()
 
     if not raw:
-        raise HTTPException(
-            status_code=400,
-            detail="Empty file",
-        )
-
+        raise HTTPException(status_code=400, detail="Empty file")
     if len(raw) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
             detail="Image exceeds the 15 MB limit",
         )
 
-    image_array = np.frombuffer(
-        raw,
-        dtype=np.uint8,
-    )
-    image = cv2.imdecode(
-        image_array,
-        cv2.IMREAD_COLOR,
-    )
-
+    image_array = np.frombuffer(raw, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
     if image is None:
         raise HTTPException(
             status_code=400,
             detail=(
                 "Upload a readable PNG/JPG image. "
-                "Render PDF pages to images before calling /decode."
+                "Render PDF pages before calling /decode."
             ),
+        )
+
+    mode = mode.strip().lower()
+    if mode not in {"fast", "exhaustive"}:
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be fast or exhaustive",
         )
 
     image_height, image_width = image.shape[:2]
     candidates_tested = 0
-    opencv_detected_count = 0
-    formats_seen = []
-
-    logging.info(
-        "Decode started version=%s width=%s height=%s bytes=%s",
-        APP_VERSION,
-        image_width,
-        image_height,
-        len(raw),
+    generator = (
+        fast_candidate_images(image)
+        if mode == "fast"
+        else exhaustive_candidate_images(image)
     )
 
-    for region_name, region in region_images(image):
-        for candidate_name, candidate in candidate_images(
-            region_name,
-            region,
+    for candidate_name, candidate in generator:
+        if (
+            mode == "exhaustive"
+            and candidates_tested >= MAX_EXHAUSTIVE_CANDIDATES
         ):
-            if candidates_tested >= MAX_CANDIDATES:
-                break
+            break
 
-            candidates_tested += 1
+        candidates_tested += 1
 
-            # ZXing-C++ is the primary multi-format decoder. It can identify
-            # QR Code, Data Matrix, PDF417, Aztec and other supported formats.
-            zxing_results = zxing_decode(candidate)
-
-            if zxing_results:
-                values = [item["value"] for item in zxing_results]
-                barcode_type = zxing_results[0]["format"]
-
-                return success_response(
-                    values=values,
-                    decoder="zxing",
-                    barcode_type=barcode_type,
-                    candidate=candidate_name,
-                    image_width=image_width,
-                    image_height=image_height,
-                    candidates_tested=candidates_tested,
-                    opencv_detected_count=opencv_detected_count,
-                )
-
-            # Retain Pyzbar as a proven QR fallback for existing good samples.
-            pyzbar_values = pyzbar_decode(candidate)
-
-            if pyzbar_values:
-                return success_response(
-                    values=pyzbar_values,
-                    decoder="pyzbar",
-                    barcode_type="QRCode",
-                    candidate=candidate_name,
-                    image_width=image_width,
-                    image_height=image_height,
-                    candidates_tested=candidates_tested,
-                    opencv_detected_count=opencv_detected_count,
-                )
-
-            # OpenCV remains a QR-specific fallback and localization helper.
-            opencv_value, rectified, detected = (
-                opencv_qr_decode_and_localize(candidate)
+        zxing_results = zxing_decode(candidate)
+        if zxing_results:
+            return success_response(
+                values=[item["value"] for item in zxing_results],
+                decoder="zxing",
+                barcode_type=zxing_results[0]["format"],
+                candidate=candidate_name,
+                image_width=image_width,
+                image_height=image_height,
+                candidates_tested=candidates_tested,
+                processing_seconds=time.monotonic() - started,
+                mode=mode,
             )
 
-            if detected:
-                opencv_detected_count += 1
+        pyzbar_values = pyzbar_decode(candidate)
+        if pyzbar_values:
+            return success_response(
+                values=pyzbar_values,
+                decoder="pyzbar",
+                barcode_type="QRCode",
+                candidate=candidate_name,
+                image_width=image_width,
+                image_height=image_height,
+                candidates_tested=candidates_tested,
+                processing_seconds=time.monotonic() - started,
+                mode=mode,
+            )
 
+        # OpenCV is skipped in fast mode because ZXing handles QR and Data
+        # Matrix and the splitter only needs a quick boundary decision.
+        if mode == "exhaustive":
+            opencv_value, rectified, _ = (
+                opencv_qr_decode_and_localize(candidate)
+            )
             if opencv_value:
                 return success_response(
                     values=[opencv_value],
@@ -475,59 +415,28 @@ async def decode_barcode(
                     image_width=image_width,
                     image_height=image_height,
                     candidates_tested=candidates_tested,
-                    opencv_detected_count=opencv_detected_count,
+                    processing_seconds=time.monotonic() - started,
+                    mode=mode,
                 )
 
             if rectified is not None:
-                rectified_name = f"{candidate_name}_rectified"
                 candidates_tested += 1
-
                 zxing_rectified = zxing_decode(rectified)
-
                 if zxing_rectified:
-                    values = [
-                        item["value"]
-                        for item in zxing_rectified
-                    ]
-                    barcode_type = zxing_rectified[0]["format"]
-
                     return success_response(
-                        values=values,
+                        values=[
+                            item["value"]
+                            for item in zxing_rectified
+                        ],
                         decoder="zxing_after_opencv_localization",
-                        barcode_type=barcode_type,
-                        candidate=rectified_name,
+                        barcode_type=zxing_rectified[0]["format"],
+                        candidate=f"{candidate_name}_rectified",
                         image_width=image_width,
                         image_height=image_height,
                         candidates_tested=candidates_tested,
-                        opencv_detected_count=opencv_detected_count,
+                        processing_seconds=time.monotonic() - started,
+                        mode=mode,
                     )
-
-                pyzbar_rectified = pyzbar_decode(rectified)
-
-                if pyzbar_rectified:
-                    return success_response(
-                        values=pyzbar_rectified,
-                        decoder="pyzbar_after_opencv_localization",
-                        barcode_type="QRCode",
-                        candidate=rectified_name,
-                        image_width=image_width,
-                        image_height=image_height,
-                        candidates_tested=candidates_tested,
-                        opencv_detected_count=opencv_detected_count,
-                    )
-
-                del rectified
-
-            del candidate
-
-        if candidates_tested >= MAX_CANDIDATES:
-            break
-
-    logging.info(
-        "No barcode decoded candidates=%s opencv_detected=%s",
-        candidates_tested,
-        opencv_detected_count,
-    )
 
     return {
         "found": False,
@@ -538,11 +447,11 @@ async def decode_barcode(
         "candidates_tested": candidates_tested,
         "image_width": image_width,
         "image_height": image_height,
-        "opencv_detected_count": opencv_detected_count,
-        "formats_seen": formats_seen,
-        "version": APP_VERSION,
-        "note": (
-            "No supported barcode payload was recovered from the supplied "
-            "pixels. ZXing, Pyzbar and OpenCV QR detection were attempted."
+        "processing_seconds": round(
+            time.monotonic() - started,
+            3,
         ),
+        "mode": mode,
+        "version": APP_VERSION,
+        "note": "No supported barcode payload was recovered.",
     }
